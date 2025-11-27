@@ -3,12 +3,19 @@ import requests
 import re
 import base64
 import logging
+import concurrent.futures
+import json
+import time
+from threading import Lock
 
 app = Flask(__name__)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Thread lock for thread-safe operations
+lock = Lock()
 
 def get_bin_info(bin_number):
     """Get BIN information from antipublic.cc API"""
@@ -295,13 +302,66 @@ def determine_vbv_status(lookup_response):
     
     return "Unknown Status - Non VBV"
 
-@app.route('/gateway', methods=['GET'])
+def process_single_card(card_data, authorization_fingerprint, include_bin_info=True):
+    """Process a single card for VBV checking"""
+    try:
+        card_number = card_data['number']
+        bin_number = card_number[:6]
+        
+        result = {
+            'card': card_number,
+            'bin': bin_number,
+            'expiry': f"{card_data['month']}/{card_data['year']}",
+            'status': 'processing'
+        }
+        
+        # Get BIN information if requested
+        if include_bin_info:
+            bin_info, bin_error = get_bin_info(bin_number)
+            if bin_error:
+                result['bin_info'] = {'error': bin_error}
+            else:
+                result['bin_info'] = bin_info
+        
+        # Tokenize credit card
+        token, error = tokenize_credit_card(authorization_fingerprint, card_data)
+        if error:
+            result['status'] = 'error'
+            result['error'] = error
+            return result
+        
+        # Perform 3D Secure lookup
+        lookup_response, error = three_d_secure_lookup(authorization_fingerprint, token, bin_number)
+        if error:
+            result['status'] = 'error'
+            result['error'] = error
+            return result
+        
+        # Determine VBV status
+        vbv_status = determine_vbv_status(lookup_response)
+        
+        result['status'] = 'completed'
+        result['vbv_status'] = vbv_status
+        result['card_details'] = {
+            'first_6': card_number[:6],
+            'last_4': card_number[-4:],
+            'length': len(card_number)
+        }
+        
+        return result
+        
+    except Exception as e:
+        return {
+            'card': card_data['number'],
+            'status': 'error',
+            'error': f"Unexpected error: {str(e)}"
+        }
+
+@app.route('/gateway', methods=['GET', 'POST'])
 def check_vbv():
-    """Main endpoint for VBV checking with BIN information"""
+    """Main endpoint for VBV checking with BIN information - supports single and mass checking"""
     # Get query parameters
     key = request.args.get('key')
-    card = request.args.get('card')
-    bin_param = request.args.get('bin')
     
     # Validate API key
     if key != 'blazedev':
@@ -310,6 +370,17 @@ def check_vbv():
             'message': 'Invalid API key',
             'developer': 'BLAZE_X_007'
         }), 401
+    
+    # Check if this is a mass check request
+    if request.method == 'POST' or request.args.get('mass') == 'true':
+        return mass_check_vbv(key)
+    else:
+        return single_check_vbv(key)
+
+def single_check_vbv(key):
+    """Handle single card checking"""
+    card = request.args.get('card')
+    bin_param = request.args.get('bin')
     
     # Validate card parameter
     if not card:
@@ -348,83 +419,35 @@ def check_vbv():
     if bin_param:
         bin_number = bin_param
     
-    logger.info(f"Processing VBV check for BIN: {bin_number}")
+    logger.info(f"Processing single VBV check for BIN: {bin_number}")
     
     try:
-        # Get BIN information first
-        bin_info, bin_error = get_bin_info(bin_number)
-        if bin_error:
-            logger.warning(f"BIN info error: {bin_error}")
-            bin_info = {
-                'bin': bin_number,
-                'vendor': 'Unknown',
-                'type': 'Unknown',
-                'level': 'Unknown',
-                'bank': 'Unknown',
-                'country': 'Unknown',
-                'country_info': 'Unknown',
-                'bank_website': 'Unknown',
-                'bank_phone': 'Unknown',
-                'valid': False,
-                'error': bin_error
-            }
-        
-        # Step 1: Get client token
+        # Get client token
         authorization_fingerprint, error = get_client_token()
         if error:
             return jsonify({
                 'status': 'error',
                 'message': error,
-                'bin_info': bin_info,
                 'developer': 'BLAZE_X_007'
             }), 500
         
-        logger.info("Successfully obtained client token")
+        # Process single card
+        result = process_single_card(card_data, authorization_fingerprint, include_bin_info=True)
         
-        # Step 2: Tokenize credit card
-        token, error = tokenize_credit_card(authorization_fingerprint, card_data)
-        if error:
+        if result['status'] == 'completed':
+            return jsonify({
+                'status': 'success',
+                'type': 'single',
+                'result': result,
+                'developer': 'BLAZE_X_007'
+            })
+        else:
             return jsonify({
                 'status': 'error',
-                'message': error,
-                'bin_info': bin_info,
+                'type': 'single',
+                'result': result,
                 'developer': 'BLAZE_X_007'
             }), 500
-        
-        logger.info("Successfully tokenized credit card")
-        
-        # Step 3: Perform 3D Secure lookup
-        lookup_response, error = three_d_secure_lookup(authorization_fingerprint, token, bin_number)
-        if error:
-            return jsonify({
-                'status': 'error',
-                'message': error,
-                'bin_info': bin_info,
-                'developer': 'BLAZE_X_007'
-            }), 500
-        
-        logger.info("Successfully performed 3D Secure lookup")
-        
-        # Step 4: Determine VBV status
-        vbv_status = determine_vbv_status(lookup_response)
-        
-        # Prepare response
-        response_data = {
-            'status': 'success',
-            'bin': bin_number,
-            'bin_info': bin_info,
-            'vbv_status': vbv_status,
-            'card_details': {
-                'first_6': card_data['number'][:6],
-                'last_4': card_data['number'][-4:],
-                'expiry': f"{card_data['month']}/{card_data['year']}",
-                'length': len(card_data['number'])
-            },
-            'full_response': lookup_response,
-            'developer': 'BLAZE_X_007'
-        }
-        
-        return jsonify(response_data)
         
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
@@ -432,6 +455,158 @@ def check_vbv():
             'status': 'error',
             'message': f'Unexpected error: {str(e)}',
             'bin': bin_number,
+            'developer': 'BLAZE_X_007'
+        }), 500
+
+def mass_check_vbv(key):
+    """Handle mass card checking"""
+    cards_data = []
+    
+    # Get cards from POST JSON or query parameter
+    if request.method == 'POST':
+        if request.is_json:
+            data = request.get_json()
+            cards = data.get('cards', [])
+        else:
+            cards_str = request.form.get('cards')
+            if cards_str:
+                try:
+                    cards = json.loads(cards_str)
+                except:
+                    cards = []
+            else:
+                cards = []
+    else:
+        # GET request with mass=true
+        cards_str = request.args.get('cards')
+        if cards_str:
+            try:
+                cards = json.loads(cards_str)
+            except:
+                cards = []
+        else:
+            cards = []
+    
+    # Validate cards data
+    if not cards:
+        return jsonify({
+            'status': 'error',
+            'message': 'No cards provided. Use JSON array or formatted string',
+            'developer': 'BLAZE_X_007'
+        }), 400
+    
+    # Parse cards
+    for i, card_item in enumerate(cards):
+        try:
+            if isinstance(card_item, str):
+                card_parts = card_item.split('|')
+                if len(card_parts) != 4:
+                    raise ValueError("Invalid card format")
+                
+                card_data = {
+                    'number': card_parts[0].strip(),
+                    'month': card_parts[1].strip(),
+                    'year': card_parts[2].strip(),
+                    'cvv': card_parts[3].strip()
+                }
+            elif isinstance(card_item, dict):
+                card_data = {
+                    'number': str(card_item.get('number', '')).strip(),
+                    'month': str(card_item.get('month', '')).strip(),
+                    'year': str(card_item.get('year', '')).strip(),
+                    'cvv': str(card_item.get('cvv', '')).strip()
+                }
+            else:
+                raise ValueError("Invalid card format")
+            
+            # Validate card number length
+            if len(card_data['number']) < 13 or len(card_data['number']) > 19:
+                raise ValueError("Invalid card number length")
+                
+            cards_data.append(card_data)
+            
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': f'Error parsing card {i+1}: {str(e)}',
+                'developer': 'BLAZE_X_007'
+            }), 400
+    
+    if not cards_data:
+        return jsonify({
+            'status': 'error',
+            'message': 'No valid cards found',
+            'developer': 'BLAZE_X_007'
+        }), 400
+    
+    logger.info(f"Processing mass VBV check for {len(cards_data)} cards")
+    
+    try:
+        # Get client token (shared for all cards)
+        authorization_fingerprint, error = get_client_token()
+        if error:
+            return jsonify({
+                'status': 'error',
+                'message': error,
+                'developer': 'BLAZE_X_007'
+            }), 500
+        
+        # Process cards concurrently with thread pool
+        max_workers = min(10, len(cards_data))  # Limit concurrent requests
+        results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all card processing tasks
+            future_to_card = {
+                executor.submit(process_single_card, card_data, authorization_fingerprint, False): card_data 
+                for card_data in cards_data
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_card):
+                card_data = future_to_card[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    results.append({
+                        'card': card_data['number'],
+                        'status': 'error',
+                        'error': f"Processing error: {str(e)}"
+                    })
+        
+        # Sort results by card number for consistency
+        results.sort(key=lambda x: x['card'])
+        
+        # Generate summary
+        total_cards = len(results)
+        completed = len([r for r in results if r['status'] == 'completed'])
+        errors = len([r for r in results if r['status'] == 'error'])
+        
+        vbv_summary = {}
+        for result in results:
+            if result['status'] == 'completed':
+                vbv_status = result.get('vbv_status', 'Unknown')
+                vbv_summary[vbv_status] = vbv_summary.get(vbv_status, 0) + 1
+        
+        return jsonify({
+            'status': 'success',
+            'type': 'mass',
+            'summary': {
+                'total_cards': total_cards,
+                'completed': completed,
+                'errors': errors,
+                'vbv_summary': vbv_summary
+            },
+            'results': results,
+            'developer': 'BLAZE_X_007'
+        })
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in mass check: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'Unexpected error: {str(e)}',
             'developer': 'BLAZE_X_007'
         }), 500
 
@@ -485,7 +660,7 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'service': 'VBV Checker API with BIN Lookup',
+        'service': 'VBV Checker API with Mass Checking',
         'developer': 'BLAZE_X_007'
     })
 
@@ -493,16 +668,35 @@ def health_check():
 def home():
     """Home endpoint with usage instructions"""
     return jsonify({
-        'message': 'VBV Checker API with BIN Lookup - BLAZE_X_007',
+        'message': 'VBV Checker API with Mass Checking - BLAZE_X_007',
         'endpoints': {
             '/gateway': {
-                'description': 'Check VBV status with BIN information',
-                'parameters': {
-                    'key': 'API key (required)',
-                    'card': 'Card details in format: cc_number|mm|yy|cvv (required)',
-                    'bin': 'BIN number (optional, will use first 6 digits of card if not provided)'
+                'description': 'Check VBV status - supports single and mass checking',
+                'single_check': {
+                    'method': 'GET',
+                    'parameters': {
+                        'key': 'API key (required)',
+                        'card': 'Card details in format: cc_number|mm|yy|cvv (required)',
+                        'bin': 'BIN number (optional)'
+                    },
+                    'example': '/gateway?key=blazedev&card=4635747880574554|09|2029|534'
                 },
-                'example': '/gateway?key=blazedev&card=4635747880574554|09|2029|534'
+                'mass_check': {
+                    'method': 'POST or GET with mass=true',
+                    'parameters': {
+                        'key': 'API key (required)',
+                        'cards': 'Array of cards in JSON format'
+                    },
+                    'examples': {
+                        'POST_JSON': {
+                            'cards': [
+                                '4635747880574554|09|2029|534',
+                                '5111111111111118|12|2025|123'
+                            ]
+                        },
+                        'GET': '/gateway?key=blazedev&mass=true&cards=[\"4635747880574554|09|2029|534\",\"5111111111111118|12|2025|123\"]'
+                    }
+                }
             },
             '/bin/{bin_number}': {
                 'description': 'Get BIN information only',
@@ -520,4 +714,4 @@ def home():
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=3030, debug=False)
+    app.run(host='0.0.0.0', port=2233, debug=False)
